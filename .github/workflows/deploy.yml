@@ -13,7 +13,7 @@ jobs:
     # Debug environment variables
     - name: Debug environment variables
       run: |
-       echo "ECR_REPOSITORY = ${{ secrets.USERNAME}}"
+       echo "ECR_REPOSITORY = ${{ vars.USERNAME}}"
         
 
 
