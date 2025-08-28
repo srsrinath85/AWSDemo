@@ -1,0 +1,56 @@
+name: Deploy to ECS
+
+on:
+  push:
+    branches:
+      - main  # Trigger deployment on push to 'main' branch
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v1
+
+    - name: Log in to Amazon ECR
+      uses: aws-actions/amazon-ecr-login@v1
+
+    - name: Build Docker image
+      run: |
+        docker build -t ${{ secrets.ECR_REPOSITORY }} .
+      
+    - name: Tag Docker image
+      run: |
+        docker tag ${{ secrets.ECR_REPOSITORY }}:latest ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_REPOSITORY }}:latest
+
+    - name: Push Docker image to ECR
+      run: |
+        docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_REPOSITORY }}:latest
+
+    - name: Register new task definition with updated image
+      run: |
+        TASK_DEF=$(aws ecs describe-task-definition --task-definition ${{ secrets.TASK_DEFINITION_NAME }} --region ${{ secrets.AWS_REGION }} --query "taskDefinition")
+        NEW_TASK_DEF=$(echo $TASK_DEF | jq '.taskDefinition | {family: .family, containerDefinitions: (.containerDefinitions | map(select(.name=="my-java-web-app") | .image = "'"${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_REPOSITORY }}:latest"'"))}')
+        
+        echo $NEW_TASK_DEF > updated_task_def.json
+
+        aws ecs register-task-definition \
+          --region ${{ secrets.AWS_REGION }} \
+          --cli-input-json file://updated_task_def.json
+
+    - name: Update ECS service to use new task definition
+      run: |
+        NEW_TASK_DEF_REVISION=$(aws ecs describe-task-definition \
+          --task-definition ${{ secrets.TASK_DEFINITION_NAME }} \
+          --region ${{ secrets.AWS_REGION }} \
+          --query "taskDefinition.revision" --output text)
+
+        aws ecs update-service \
+          --cluster ${{ secrets.ECS_CLUSTER }} \
+          --service ${{ secrets.ECS_SERVICE }} \
+          --task-definition ${{ secrets.TASK_DEFINITION_NAME }}:${NEW_TASK_DEF_REVISION} \
+          --region ${{ secrets.AWS_REGION }}
