@@ -18,16 +18,16 @@ jobs:
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v1
 
-    # Step 3: Log in to Amazon ECR with AWS region
+    # Step 3: Build Docker image
+    - name: Build Docker image
+      run: |
+        docker build -t ${{ secrets.ECR_REPOSITORY }} .
+
+    # Step 4: Log in to Amazon ECR with region (moved after build)
     - name: Log in to Amazon ECR
       uses: aws-actions/amazon-ecr-login@v1
       with:
         region: eu-west-3  # Ensure region is passed to ECR login
-
-    # Step 4: Build Docker image
-    - name: Build Docker image
-      run: |
-        docker build -t ${{ secrets.ECR_REPOSITORY }} .
 
     # Step 5: Tag Docker image
     - name: Tag Docker image
