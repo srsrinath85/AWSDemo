@@ -10,27 +10,36 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+    # Step 1: Checkout the code from GitHub repository
     - name: Checkout code
       uses: actions/checkout@v2
 
+    # Step 2: Set up Docker Buildx (useful for multi-platform builds)
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v1
 
+    # Step 3: Log in to Amazon ECR with AWS region
     - name: Log in to Amazon ECR
       uses: aws-actions/amazon-ecr-login@v1
+      with:
+        region: ${{ secrets.AWS_REGION }} # Ensure region is passed to ECR login
 
+    # Step 4: Build Docker image
     - name: Build Docker image
       run: |
         docker build -t ${{ secrets.ECR_REPOSITORY }} .
-      
+
+    # Step 5: Tag Docker image
     - name: Tag Docker image
       run: |
         docker tag ${{ secrets.ECR_REPOSITORY }}:latest ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_REPOSITORY }}:latest
 
+    # Step 6: Push Docker image to ECR
     - name: Push Docker image to ECR
       run: |
         docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_REPOSITORY }}:latest
 
+    # Step 7: Register new ECS task definition with updated image
     - name: Register new task definition with updated image
       run: |
         TASK_DEF=$(aws ecs describe-task-definition --task-definition ${{ secrets.TASK_DEFINITION_NAME }} --region ${{ secrets.AWS_REGION }} --query "taskDefinition")
@@ -42,6 +51,7 @@ jobs:
           --region ${{ secrets.AWS_REGION }} \
           --cli-input-json file://updated_task_def.json
 
+    # Step 8: Update ECS service to use the new task definition
     - name: Update ECS service to use new task definition
       run: |
         NEW_TASK_DEF_REVISION=$(aws ecs describe-task-definition \
