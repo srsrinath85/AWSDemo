@@ -1,4 +1,4 @@
-name: Deploy to ECS (Fargate) with Unique Docker Tag
+name: Deploy to ECS
 
 on:
   push:
@@ -11,65 +11,74 @@ jobs:
 
     env:
       AWS_REGION: ${{ secrets.AWS_REGION }}
-      ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
-      IMAGE_REPO_NAME: ${{ secrets.ECR_REPOSITORY }}
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+      ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
       IMAGE_TAG: myjavaapp-${{ github.run_number }}-${{ github.sha }}
+      ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
 
     steps:
-    # Step 1: Checkout code
+    # 1. Checkout Code
     - name: Checkout code
       uses: actions/checkout@v2
 
-    # Step 2: Set up Docker Buildx
+    # 2. Set up Docker Buildx
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v1
 
-    # Step 3: Build Docker image with a unique tag
-    - name: Build Docker image
+    # 3. Build Docker Image (✅ before AWS login)
+    - name: Build Docker Image
       run: |
-        docker build -t $IMAGE_REPO_NAME:$IMAGE_TAG .
+        docker build -t $ECR_REPOSITORY:$IMAGE_TAG .
 
-    # Step 4: Log in to Amazon ECR
+    # 4. Configure AWS credentials
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+
+    # 5. Login to Amazon ECR
     - name: Login to Amazon ECR
       uses: aws-actions/amazon-ecr-login@v1
       with:
         region: ${{ secrets.AWS_REGION }}
 
-    # Step 5: Tag image for ECR
-    - name: Tag image
+    # 6. Tag Docker Image for ECR
+    - name: Tag Docker image
       run: |
-        docker tag $IMAGE_REPO_NAME:$IMAGE_TAG $ECR_REGISTRY/$IMAGE_REPO_NAME:$IMAGE_TAG
+        docker tag $ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
-    # Step 6: Push image to ECR
-    - name: Push image to ECR
+    # 7. Push Docker Image to ECR
+    - name: Push Docker Image to ECR
       run: |
-        docker push $ECR_REGISTRY/$IMAGE_REPO_NAME:$IMAGE_TAG
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
-    # Step 7: Get current task definition
-    - name: Download existing task definition
+    # 8. Download current ECS Task Definition
+    - name: Get current task definition
       run: |
         aws ecs describe-task-definition \
           --task-definition ${{ secrets.TASK_DEFINITION_NAME }} \
           --region $AWS_REGION \
           --query "taskDefinition" > task-definition.json
 
-    # Step 8: Replace image in task definition
+    # 9. Update task definition with new image
     - name: Update image in task definition
       run: |
-        jq --arg IMAGE "$ECR_REGISTRY/$IMAGE_REPO_NAME:$IMAGE_TAG" \
-        '.containerDefinitions[0].image = $IMAGE | 
+        jq --arg IMAGE "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
+        '.containerDefinitions[0].image = $IMAGE |
          {family: .family, executionRoleArn, taskRoleArn, networkMode, containerDefinitions, requiresCompatibilities, cpu, memory}' \
         task-definition.json > new-task-def.json
 
-    # Step 9: Register new task definition revision
-    - name: Register new task definition
+    # 10. Register new task definition
+    - name: Register new ECS task definition
       run: |
         aws ecs register-task-definition \
           --region $AWS_REGION \
           --cli-input-json file://new-task-def.json
 
-    # Step 10: Update ECS service with new task definition
-    - name: Deploy updated task definition to ECS
+    # 11. Update ECS service with new task definition revision
+    - name: Update ECS service
       run: |
         NEW_REVISION=$(aws ecs describe-task-definition \
           --task-definition ${{ secrets.TASK_DEFINITION_NAME }} \
