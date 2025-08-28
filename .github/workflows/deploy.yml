@@ -1,66 +1,83 @@
-name: Deploy to ECS
+name: Deploy to ECS (Fargate) with Unique Docker Tag
 
 on:
   push:
     branches:
-      - main  # Trigger deployment on push to 'main' branch
+      - main
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
 
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+      IMAGE_REPO_NAME: ${{ secrets.ECR_REPOSITORY }}
+      IMAGE_TAG: myjavaapp-${{ github.run_number }}-${{ github.sha }}
+
     steps:
-    # Step 1: Checkout the code from GitHub repository
+    # Step 1: Checkout code
     - name: Checkout code
       uses: actions/checkout@v2
 
-    # Step 2: Set up Docker Buildx (useful for multi-platform builds)
+    # Step 2: Set up Docker Buildx
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v1
 
-    # Step 3: Build Docker image
+    # Step 3: Build Docker image with a unique tag
     - name: Build Docker image
       run: |
-        docker build -t ${{ secrets.ECR_REPOSITORY }} .
+        docker build -t $IMAGE_REPO_NAME:$IMAGE_TAG .
 
-    # Step 4: Log in to Amazon ECR with region (moved after build)
-    - name: Log in to Amazon ECR
+    # Step 4: Log in to Amazon ECR
+    - name: Login to Amazon ECR
       uses: aws-actions/amazon-ecr-login@v1
       with:
-        region: eu-west-3  # Ensure region is passed to ECR login
+        region: ${{ secrets.AWS_REGION }}
 
-    # Step 5: Tag Docker image
-    - name: Tag Docker image
+    # Step 5: Tag image for ECR
+    - name: Tag image
       run: |
-        docker tag ${{ secrets.ECR_REPOSITORY }}:latest ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.eu-west-3.amazonaws.com/${{ secrets.ECR_REPOSITORY }}:latest
+        docker tag $IMAGE_REPO_NAME:$IMAGE_TAG $ECR_REGISTRY/$IMAGE_REPO_NAME:$IMAGE_TAG
 
-    # Step 6: Push Docker image to ECR
-    - name: Push Docker image to ECR
+    # Step 6: Push image to ECR
+    - name: Push image to ECR
       run: |
-        docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.eu-west-3.amazonaws.com/${{ secrets.ECR_REPOSITORY }}:latest
+        docker push $ECR_REGISTRY/$IMAGE_REPO_NAME:$IMAGE_TAG
 
-    # Step 7: Register new ECS task definition with updated image
-    - name: Register new task definition with updated image
+    # Step 7: Get current task definition
+    - name: Download existing task definition
       run: |
-        TASK_DEF=$(aws ecs describe-task-definition --task-definition ${{ secrets.TASK_DEFINITION_NAME }} --region eu-west-3 --query "taskDefinition")
-        NEW_TASK_DEF=$(echo $TASK_DEF | jq '.taskDefinition | {family: .family, containerDefinitions: (.containerDefinitions | map(select(.name=="my-java-web-app") | .image = "'"${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.eu-west-3.amazonaws.com/${{ secrets.ECR_REPOSITORY }}:latest"'"))}')
-        
-        echo $NEW_TASK_DEF > updated_task_def.json
-
-        aws ecs register-task-definition \
-          --region eu-west-3 \
-          --cli-input-json file://updated_task_def.json
-
-    # Step 8: Update ECS service to use new task definition
-    - name: Update ECS service to use new task definition
-      run: |
-        NEW_TASK_DEF_REVISION=$(aws ecs describe-task-definition \
+        aws ecs describe-task-definition \
           --task-definition ${{ secrets.TASK_DEFINITION_NAME }} \
-          --region eu-west-3 \
+          --region $AWS_REGION \
+          --query "taskDefinition" > task-definition.json
+
+    # Step 8: Replace image in task definition
+    - name: Update image in task definition
+      run: |
+        jq --arg IMAGE "$ECR_REGISTRY/$IMAGE_REPO_NAME:$IMAGE_TAG" \
+        '.containerDefinitions[0].image = $IMAGE | 
+         {family: .family, executionRoleArn, taskRoleArn, networkMode, containerDefinitions, requiresCompatibilities, cpu, memory}' \
+        task-definition.json > new-task-def.json
+
+    # Step 9: Register new task definition revision
+    - name: Register new task definition
+      run: |
+        aws ecs register-task-definition \
+          --region $AWS_REGION \
+          --cli-input-json file://new-task-def.json
+
+    # Step 10: Update ECS service with new task definition
+    - name: Deploy updated task definition to ECS
+      run: |
+        NEW_REVISION=$(aws ecs describe-task-definition \
+          --task-definition ${{ secrets.TASK_DEFINITION_NAME }} \
+          --region $AWS_REGION \
           --query "taskDefinition.revision" --output text)
 
         aws ecs update-service \
           --cluster ${{ secrets.ECS_CLUSTER }} \
           --service ${{ secrets.ECS_SERVICE }} \
-          --task-definition ${{ secrets.TASK_DEFINITION_NAME }}:${NEW_TASK_DEF_REVISION} \
-          --region eu-west-3
+          --task-definition ${{ secrets.TASK_DEFINITION_NAME }}:$NEW_REVISION \
+          --region $AWS_REGION
