@@ -38,23 +38,31 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ secrets.AWS_REGION }}
 
-    # 5. Login to Amazon ECR
+    # 5. Debug Environment Variables
+    - name: Debug environment variables
+      run: |
+        echo "AWS_REGION = $AWS_REGION"
+        echo "AWS_ACCOUNT_ID = $AWS_ACCOUNT_ID"
+        echo "ECR_REPOSITORY = $ECR_REPOSITORY"
+        echo "IMAGE_TAG = $IMAGE_TAG"
+
+    # 6. Log in to Amazon ECR (Handles region automatically)
     - name: Login to Amazon ECR
       uses: aws-actions/amazon-ecr-login@v1
       with:
         region: ${{ secrets.AWS_REGION }}
 
-    # 6. Tag Docker Image for ECR
+    # 7. Tag Docker Image for ECR
     - name: Tag Docker image
       run: |
         docker tag $ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
-    # 7. Push Docker Image to ECR
+    # 8. Push Docker Image to ECR
     - name: Push Docker Image to ECR
       run: |
         docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
-    # 8. Download current ECS Task Definition
+    # 9. Download current ECS Task Definition
     - name: Get current task definition
       run: |
         aws ecs describe-task-definition \
@@ -62,7 +70,7 @@ jobs:
           --region $AWS_REGION \
           --query "taskDefinition" > task-definition.json
 
-    # 9. Update task definition with new image
+    # 10. Update task definition with new image
     - name: Update image in task definition
       run: |
         jq --arg IMAGE "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
@@ -70,14 +78,14 @@ jobs:
          {family: .family, executionRoleArn, taskRoleArn, networkMode, containerDefinitions, requiresCompatibilities, cpu, memory}' \
         task-definition.json > new-task-def.json
 
-    # 10. Register new task definition
+    # 11. Register new task definition
     - name: Register new ECS task definition
       run: |
         aws ecs register-task-definition \
           --region $AWS_REGION \
           --cli-input-json file://new-task-def.json
 
-    # 11. Update ECS service with new task definition revision
+    # 12. Update ECS service with new task definition revision
     - name: Update ECS service
       run: |
         NEW_REVISION=$(aws ecs describe-task-definition \
