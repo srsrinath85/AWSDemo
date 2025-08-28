@@ -13,9 +13,7 @@ jobs:
     # Debug environment variables
     - name: Debug environment variables
       run: |
-        echo "AWS_REGION = ${{ secrets.AWS_ACCESS_KEY_ID }}"
-        echo "AWS_ACCOUNT_ID = ${{ secrets.AWS_SECRET_ACCESS_KEY}}"
-        echo "ECR_REPOSITORY = ${{ secrets.AWS_REGION}}"
+       echo "ECR_REPOSITORY = ${{ secrets.USERNAME}}"
         
 
 
