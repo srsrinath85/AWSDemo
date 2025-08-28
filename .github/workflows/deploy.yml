@@ -14,6 +14,9 @@ jobs:
     - name: Debug environment variables
       run: |
        echo "ECR_REPOSITORY = ${{ vars.USERNAME}}"
+
+
+
         
 
 
