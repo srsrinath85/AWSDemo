@@ -117,14 +117,38 @@ jobs:
 
       - name: Update ECS service to use the new task definition
         run: |
+          # Get the current task definition revision
           NEW_TASK_DEF_REVISION=$(aws ecs describe-task-definition \
             --task-definition ${{ secrets.TASK_DEFINITION_NAME }} \
             --region $AWS_REGION \
-            --query "taskDefinition.revision" \
-            --output text)
+            --query "taskDefinition.revision" --output text)
+          
+          if [ "$NEW_TASK_DEF_REVISION" == "None" ] || [ -z "$NEW_TASK_DEF_REVISION" ]; then
+            echo "❌ Failed to retrieve task definition revision."
+            exit 1
+          else
+            echo "✅ Task definition revision: $NEW_TASK_DEF_REVISION"
+          fi
 
+          # Check if the ECS service exists
+          SERVICE_EXISTS=$(aws ecs describe-services \
+            --cluster ${{ secrets.ECS_CLUSTER }} \
+            --services ${{ secrets.ECS_SERVICE }} \
+            --region $AWS_REGION \
+            --query "services[0].serviceName" --output text)
+
+          if [ "$SERVICE_EXISTS" == "None" ]; then
+            echo "❌ ECS service does not exist."
+            exit 1
+          else
+            echo "✅ ECS service exists: $SERVICE_EXISTS"
+          fi
+
+          # Update the ECS service with the new task definition revision
           aws ecs update-service \
             --cluster ${{ secrets.ECS_CLUSTER }} \
             --service ${{ secrets.ECS_SERVICE }} \
             --task-definition ${{ secrets.TASK_DEFINITION_NAME }}:$NEW_TASK_DEF_REVISION \
             --region $AWS_REGION
+
+          echo "✅ ECS service updated with the new task definition revision."
