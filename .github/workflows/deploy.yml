@@ -1,23 +1,84 @@
-name: Deploy to ECS
+name: Deploy to ECS Fargate
 
 on:
   push:
     branches:
-      - main
+      - main  # Trigger deployment on push to the 'main' branch
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
-    # Debug environment variables
+    # Step 1: Checkout the code from GitHub repository
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    # Step 2: Set up Docker Buildx
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v1
+
+    # Step 3: Debug environment variables
     - name: Debug environment variables
       run: |
-       echo "ECR_REPOSITORY = ${{ vars.USERNAME}}"
+        echo "AWS_REGION = ${{ secrets.AWS_REGION }}"
+        echo "AWS_ACCOUNT_ID = ${{ secrets.AWS_ACCOUNT_ID }}"
+        echo "ECR_REPOSITORY = ${{ secrets.ECR_REPOSITORY }}"
+        echo "ECS_CLUSTER = ${{ secrets.ECS_CLUSTER }}"
+        echo "ECS_SERVICE = ${{ secrets.ECS_SERVICE }}"
+        echo "TASK_DEFINITION_NAME = ${{ secrets.TASK_DEFINITION_NAME }}"
+        echo "AWS_ACCESS_KEY_ID = ${{ secrets.AWS_ACCESS_KEY_ID }}"
+        echo "AWS_SECRET_ACCESS_KEY = ${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+     # Step 5: Build Docker image
+    - name: Build Docker image
+      run: |
+        docker build -t myjavaweb12:latest .     
 
+    # Step 4: Log in to Amazon ECR using AWS secrets
+    - name: Log in to Amazon ECR
+      uses: aws-actions/amazon-ecr-login@v1
+      with:
+        region: ${{ secrets.AWS_REGION }}
 
+   
 
+    # Step 6: Tag Docker image for ECR
+    - name: Tag Docker image
+      run: |
+        docker tag ${{ secrets.ECR_REPOSITORY }}:${{ github.sha }} \
+          ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_REPOSITORY }}:${{ github.sha }}
+
+    # Step 7: Push Docker image to Amazon ECR
+    - name: Push Docker image to ECR
+      run: |
+        docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_REPOSITORY }}:${{ github.sha }}
+
+    # Step 8: Register new ECS task definition with updated image
+    - name: Register new ECS task definition with updated image
+      run: |
+        TASK_DEF=$(aws ecs describe-task-definition \
+          --task-definition ${{ secrets.TASK_DEFINITION_NAME }} \
+          --region ${{ secrets.AWS_REGION }} \
+          --query "taskDefinition")
         
+        NEW_TASK_DEF=$(echo $TASK_DEF | jq '.taskDefinition | {family: .family, containerDefinitions: (.containerDefinitions | map(select(.name=="my-java-web-app") | .image = "'"${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_REPOSITORY }}:${{ github.sha }}"'"))}')
+        
+        echo $NEW_TASK_DEF > updated_task_def.json
 
+        aws ecs register-task-definition \
+          --region ${{ secrets.AWS_REGION }} \
+          --cli-input-json file://updated_task_def.json
 
- 
+    # Step 9: Update ECS service to use the new task definition
+    - name: Update ECS service to use the new task definition
+      run: |
+        NEW_TASK_DEF_REVISION=$(aws ecs describe-task-definition \
+          --task-definition ${{ secrets.TASK_DEFINITION_NAME }} \
+          --region ${{ secrets.AWS_REGION }} \
+          --query "taskDefinition.revision" --output text)
+
+        aws ecs update-service \
+          --cluster ${{ secrets.ECS_CLUSTER }} \
+          --service ${{ secrets.ECS_SERVICE }} \
+          --task-definition ${{ secrets.TASK_DEFINITION_NAME }}:${NEW_TASK_DEF_REVISION} \
+          --region ${{ secrets.AWS_REGION }}
