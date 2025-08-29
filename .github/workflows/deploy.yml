@@ -18,12 +18,12 @@ jobs:
     - name: Debug - Verify Dockerfile
       run: |
         echo "🧪 Checking for Dockerfile..."
-        ls -la
-        if [ ! -f Dockerfile ]; then
-          echo "❌ Dockerfile not found!"
-          exit 1
+        ls -la myjavaapp
+        if [ ! -f myjavaapp/Dockerfile ]; then
+        echo "❌ Dockerfile not found in myjavaapp!"
+        exit 1
         else
-          echo "✅ Dockerfile exists."
+        echo "✅ Dockerfile found in myjavaapp."
         fi
 
     # Step 3: Set up Docker Buildx
@@ -33,9 +33,8 @@ jobs:
     # Step 4: Build Docker image and tag it with the Git SHA
     - name: Build Docker image
       run: |
-        IMAGE_TAG=${{ github.sha }}
-        docker build -t ${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG .
-
+        IMAGE_TAG=${{ github.sha}}
+        docker build -t ${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG myjavaapp/
         
     # Step 3: Debug environment variables
     - name: Debug environment variables
