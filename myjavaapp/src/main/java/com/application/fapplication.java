@@ -14,7 +14,8 @@ public class fapplication {
 
     @GetMapping("/")
     public String home() {
-        return "🚀Welcome to Fargate automatically build docker image and pipeline everything!!";
+        return "🚀Welcome to Fargate automatically build docker image and process should be automatically done using ci/cd pipeline";
     }
 }
+
 
