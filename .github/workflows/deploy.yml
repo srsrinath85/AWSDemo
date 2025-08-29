@@ -117,12 +117,11 @@ jobs:
 
       - name: Update ECS service to use the new task definition
         run: |
-          # Get the current task definition revision
           NEW_TASK_DEF_REVISION=$(aws ecs describe-task-definition \
             --task-definition ${{ secrets.TASK_DEFINITION_NAME }} \
             --region $AWS_REGION \
             --query "taskDefinition.revision" --output text)
-          
+
           if [ "$NEW_TASK_DEF_REVISION" == "None" ] || [ -z "$NEW_TASK_DEF_REVISION" ]; then
             echo "❌ Failed to retrieve task definition revision."
             exit 1
@@ -130,7 +129,6 @@ jobs:
             echo "✅ Task definition revision: $NEW_TASK_DEF_REVISION"
           fi
 
-          # Check if the ECS service exists
           SERVICE_EXISTS=$(aws ecs describe-services \
             --cluster ${{ secrets.ECS_CLUSTER }} \
             --services ${{ secrets.ECS_SERVICE }} \
@@ -144,11 +142,37 @@ jobs:
             echo "✅ ECS service exists: $SERVICE_EXISTS"
           fi
 
-          # Update the ECS service with the new task definition revision
           aws ecs update-service \
             --cluster ${{ secrets.ECS_CLUSTER }} \
             --service ${{ secrets.ECS_SERVICE }} \
             --task-definition ${{ secrets.TASK_DEFINITION_NAME }}:$NEW_TASK_DEF_REVISION \
-            --region $AWS_REGION
+            --region $AWS_REGION \
+            --force-new-deployment
 
-          echo "✅ ECS service updated with the new task definition revision."
+          echo "✅ ECS service updated with the new task definition revision and forced new deployment."
+
+      - name: Cleanup old ECR images (keep only latest 5)
+        run: |
+          REPO_NAME=${{ secrets.ECR_REPOSITORY }}
+          REGION=$AWS_REGION
+          ACCOUNT_ID=${{ secrets.AWS_ACCOUNT_ID }}
+
+          echo "Cleaning up old images in ECR repository $REPO_NAME except latest 5..."
+
+          # Get image digests sorted by pushedAt desc (latest first)
+          IMAGES=$(aws ecr list-images --repository-name $REPO_NAME --region $REGION --query 'imageIds[*]' --output json)
+          COUNT=$(echo $IMAGES | jq length)
+
+          if [ "$COUNT" -le 1 ]; then
+            echo "Less or equal to 5 images, no cleanup needed."
+            exit 0
+          fi
+
+          TO_DELETE=$(echo $IMAGES | jq 'sort_by(.imagePushedAt) | reverse | .[1:] | .[].imageDigest' | tr -d '"')
+
+          for digest in $TO_DELETE; do
+            echo "Deleting image with digest $digest"
+            aws ecr batch-delete-image --repository-name $REPO_NAME --region $REGION --image-ids imageDigest=$digest
+          done
+
+          echo "✅ Cleanup completed."
