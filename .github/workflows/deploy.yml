@@ -30,16 +30,6 @@ jobs:
             echo "✅ Dockerfile found in myjavaapp."
           fi
 
-      # Step 3: Set up Docker Buildx
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v1
-
-      # Step 4: Build Docker image (from myjavaapp folder)
-      - name: Build Docker image
-        run: |
-          IMAGE_TAG=${{ github.sha }}
-          docker build -t ${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG myjavaapp/
-          
       # Step 3: Debug environment variables
       - name: Debug environment variables
         run: |
@@ -52,50 +42,71 @@ jobs:
           echo "AWS_ACCESS_KEY_ID = ${{ secrets.AWS_ACCESS_KEY_ID }}"
           echo "AWS_SECRET_ACCESS_KEY = ${{ secrets.AWS_SECRET_ACCESS_KEY }}"
 
+      # Step 4: Set up Docker Buildx
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
 
+      # Step 5: Build Docker image (from myjavaapp folder)
+      - name: Build Docker image
+        run: |
+          IMAGE_TAG=${{ github.sha }}
+          docker build -t ${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG myjavaapp/
+          echo "✅ Docker image built successfully: ${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG"
 
-      # Step 5: Set AWS region for CLI
+      # Step 6: Set AWS region for CLI
       - name: Set AWS region
         run: |
           aws configure set region $AWS_REGION
 
-      # Step 6: Log in to Amazon ECR
+      # Step 7: Log in to Amazon ECR (authenticate Docker)
       - name: Log in to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v1
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
 
-      # Step 7: Tag Docker image with full ECR repository URI
+      # Step 8: Tag Docker image for ECR
       - name: Tag Docker image
         run: |
           IMAGE_TAG=${{ github.sha }}
           docker tag ${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG \
             ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${AWS_REGION}.amazonaws.com/${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG
+          echo "✅ Docker image tagged: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${AWS_REGION}.amazonaws.com/${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG"
 
-      # Step 8: Push Docker image to Amazon ECR
+      # Step 9: Push Docker image to Amazon ECR
       - name: Push Docker image to ECR
         run: |
           IMAGE_TAG=${{ github.sha }}
           docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${AWS_REGION}.amazonaws.com/${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG
+          echo "✅ Docker image pushed to ECR."
 
-      # Step 9: Register new ECS task definition with updated image
-      - name: Register new ECS task definition
+      # Step 10: Register new ECS task definition with updated image
+      - name: Register new ECS task definition with updated image
         run: |
           IMAGE=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${AWS_REGION}.amazonaws.com/${{ secrets.ECR_REPOSITORY }}:${{ github.sha }}
-
+          
           TASK_DEF=$(aws ecs describe-task-definition \
             --task-definition ${{ secrets.TASK_DEFINITION_NAME }} \
-            --region $AWS_REGION \
-            --query "taskDefinition")
+            --region $AWS_REGION)
 
-          NEW_TASK_DEF=$(echo $TASK_DEF | jq '.taskDefinition | {family: .family, containerDefinitions: (.containerDefinitions | map(if .name=="my-java-web-app" then .image = "'"$IMAGE"'" else . end))}')
+          echo "TASK_DEF: $TASK_DEF"
 
+          if [ "$TASK_DEF" == "null" ] || [ -z "$TASK_DEF" ]; then
+            echo "❌ Task Definition not found!"
+            exit 1
+          fi
+
+          NEW_TASK_DEF=$(echo $TASK_DEF | jq -e '.taskDefinition | {family: .family, containerDefinitions: (.containerDefinitions | map(if .name=="my-java-web-app" then .image = "'"$IMAGE"'" else . end))}')
+          
           echo $NEW_TASK_DEF > updated_task_def.json
 
           aws ecs register-task-definition \
             --region $AWS_REGION \
             --cli-input-json file://updated_task_def.json
 
-      # Step 10: Update ECS service to use the new task definition revision
-      - name: Update ECS service
+      # Step 11: Update ECS service to use the new task definition revision
+      - name: Update ECS service to use the new task definition
         run: |
           NEW_TASK_DEF_REVISION=$(aws ecs describe-task-definition \
             --task-definition ${{ secrets.TASK_DEFINITION_NAME }} \
@@ -108,6 +119,3 @@ jobs:
             --service ${{ secrets.ECS_SERVICE }} \
             --task-definition ${{ secrets.TASK_DEFINITION_NAME }}:$NEW_TASK_DEF_REVISION \
             --region $AWS_REGION
-
-        
-    
