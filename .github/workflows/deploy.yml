@@ -51,9 +51,10 @@ jobs:
 
     # Step 5: Log in to Amazon ECR
     - name: Log in to Amazon ECR
-      uses: aws-actions/amazon-ecr-login@v1
-      with:
-        region: ${{ secrets.AWS_REGION }}
+      run: |
+        aws configure set region ${{ secrets.AWS_REGION }}
+    - name: Log in to Amazon ECR
+      uses: aws-actions/amazon-ecr-login@v1    
 
     # Step 6: Tag Docker image with full ECR path
     - name: Tag Docker image
