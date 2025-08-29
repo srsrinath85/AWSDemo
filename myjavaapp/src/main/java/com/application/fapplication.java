@@ -14,6 +14,7 @@ public class fapplication {
 
     @GetMapping("/")
     public String home() {
-        return "🚀 Welcome to Fargate automatically update web application.!";
+        return "🚀Welcome to Fargate automatically build docker image and pipeline everything!!";
     }
 }
+
