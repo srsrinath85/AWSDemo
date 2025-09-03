@@ -1,4 +1,4 @@
-name: Deploy to ECS Fargate with Auto Rollback
+name: Deploy to ECS Fargate with Smart Fallback Rollback
 
 on:
   push:
@@ -12,100 +12,140 @@ jobs:
       AWS_REGION: ${{ secrets.AWS_REGION }}
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+    - name: Checkout code
+      uses: actions/checkout@v3
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Determine next version and unique tag
-        id: version
-        run: |
-          REPO=${{ secrets.ECR_REPOSITORY }}
-          IMAGE_TAGS=$(aws ecr list-images --repository-name $REPO --query 'imageIds[].imageTag' --output text | tr '\t' '\n')
-          VERSIONS=$(echo "$IMAGE_TAGS" | grep -Eo '^v[0-9]+' | sed 's/v//' | sort -nr)
-          MAX=${VERSIONS%%$'\n'*}
-          MAX=${MAX:-0}
-          NEXT=$((MAX + 1))
-          RANDOM=$(openssl rand -hex 3)
-          NEW_TAG="v${NEXT}-${RANDOM}"
-          echo "IMAGE_TAG=$NEW_TAG" >> $GITHUB_ENV
-          echo "Using tag $NEW_TAG"
+    - name: Set AWS region
+      run: aws configure set region $AWS_REGION
 
-      - name: Build and push Docker image
-        run: |
-          IMAGE_URI=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.$AWS_REGION.amazonaws.com/${{ secrets.ECR_REPOSITORY }}
-          docker build -t $IMAGE_URI:$IMAGE_TAG myjavaapp/
-          docker push $IMAGE_URI:$IMAGE_TAG
-          echo "Built and pushed: $IMAGE_URI:$IMAGE_TAG"
+    - name: Generate new image tag
+      id: versioning
+      run: |
+        REPO=${{ secrets.ECR_REPOSITORY }}
+        REGION=$AWS_REGION
+        ACCOUNT=${{ secrets.AWS_ACCOUNT_ID }}
 
-      - name: Fetch current task definition revision
-        id: current
-        run: |
-          aws ecs describe-task-definition --task-definition ${{ secrets.TASK_DEFINITION_NAME }} --region $AWS_REGION > td.json
-          REV=$(jq -r '.taskDefinition.revision' td.json)
-          echo "CURRENT_REV=$REV" >> $GITHUB_ENV
+        IMAGE_TAGS=$(aws ecr list-images \
+          --repository-name $REPO --region $REGION \
+          --query 'imageIds[*].imageTag' \
+          --output text | tr '\t' '\n')
 
-      - name: Register new task definition
-        id: register
-        run: |
-          IMAGE_URI=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.$AWS_REGION.amazonaws.com/${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG
-          jq --arg IMG "$IMAGE_URI" '.taskDefinition |
-            { family: .family,
-              taskRoleArn: (.taskRoleArn//""),
-              executionRoleArn: (.executionRoleArn//""),
-              networkMode: .networkMode,
-              containerDefinitions: (.containerDefinitions|map(if .name=="Democontainer" then .image=$IMG else . end)),
-              volumes: .volumes,
-              placementConstraints: .placementConstraints,
-              requiresCompatibilities: .requiresCompatibilities,
-              cpu: .cpu,
-              memory: .memory,
-              runtimePlatform: .runtimePlatform }' td.json > new-td.json
+        VNUM=$(echo "$IMAGE_TAGS" | grep -Eo '^v[0-9]+' | sed 's/v//' | sort -nr | head -n1)
+        VNUM=${VNUM:-0}
+        NEXT=$((VNUM + 1))
+        SUFFIX=$(openssl rand -hex 3)
+        TAG="v${NEXT}-${SUFFIX}"
 
-          aws ecs register-task-definition --cli-input-json file://new-td.json --region $AWS_REGION > reg.json
-          NEW_REV=$(jq -r '.taskDefinition.revision' reg.json)
-          echo "NEW_REV=$NEW_REV" >> $GITHUB_ENV
+        echo "IMAGE_TAG=$TAG" >> $GITHUB_ENV
+        echo "VERSION_NUMBER=$NEXT" >> $GITHUB_ENV
+        echo "Using new image tag: $TAG"
 
-      - name: Deploy new revision
-        run: |
-          aws ecs update-service --cluster ${{ secrets.ECS_CLUSTER }} \
-            --service ${{ secrets.ECS_SERVICE }} \
-            --task-definition ${{ secrets.TASK_DEFINITION_NAME }}:$NEW_REV \
-            --force-new-deployment --region $AWS_REGION
+    - name: Setup Docker Buildx
+      uses: docker/setup-buildx-action@v1
 
-      - name: Wait for deployment
-        run: |
-          set -e
-          aws ecs wait services-stable --cluster ${{ secrets.ECS_CLUSTER }} --services ${{ secrets.ECS_SERVICE }} --region $AWS_REGION
+    - name: Login to Amazon ECR
+      uses: aws-actions/amazon-ecr-login@v1
 
-      - name: Smart Fallback Rollback on Failure
-        if: failure()
-        run: |
-          echo "Deployment failed. Attempting fallback rollback..."
-          FAMILY=${{ secrets.TASK_DEFINITION_NAME }}
+    - name: Build & push Docker image
+      run: |
+        IMAGE=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_REPOSITORY }}
+        docker build -t $IMAGE:$IMAGE_TAG myjavaapp/
+        docker push $IMAGE:$IMAGE_TAG
+        echo "Pushed: $IMAGE:$IMAGE_TAG"
 
-          for ARN in $(aws ecs list-task-definitions --family-prefix $FAMILY --sort DESC --region $AWS_REGION --query 'taskDefinitionArns' --output text); do
-            REV=$(echo "$ARN" | awk -F: '{print $NF}')
-            IMAGE=$(aws ecs describe-task-definition --task-definition $ARN --region $AWS_REGION \
-                     | jq -r '.taskDefinition.containerDefinitions[0].image')
-            TAG=$(echo "$IMAGE" | awk -F: '{print $2}')
+    - name: Fetch current task-definition revision
+      id: fetch_current
+      run: |
+        aws ecs describe-task-definition \
+          --task-definition ${{ secrets.TASK_DEFINITION_NAME }} \
+          --region $AWS_REGION > current.json
+        REV=$(jq -r '.taskDefinition.revision' current.json)
+        echo "CURRENT_REVISION=$REV" >> $GITHUB_ENV
 
-            aws ecr describe-images --repository-name $REPO --region $AWS_REGION \
-              --image-ids imageTag=$TAG &> /dev/null && {
-                echo "Rolling back to revision $REV (image $TAG)"
-                aws ecs update-service --cluster ${{ secrets.ECS_CLUSTER }} \
-                  --service ${{ secrets.ECS_SERVICE }} \
-                  --task-definition $FAMILY:$REV \
-                  --force-new-deployment --region $AWS_REGION
-                echo "Rollback successful to $REV"
-                exit 0
-              }
-          done
+    - name: Register new task definition
+      id: register_task_def
+      run: |
+        IMAGE_URI=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG
+        jq --arg IMG "$IMAGE_URI" '.taskDefinition |
+          {
+            family: .family,
+            taskRoleArn: (.taskRoleArn // ""),
+            executionRoleArn: (.executionRoleArn // ""),
+            networkMode: .networkMode,
+            containerDefinitions: (.containerDefinitions | map(
+              if .name == "Democontainer" then .image = $IMG else . end
+            )),
+            volumes: .volumes,
+            placementConstraints: .placementConstraints,
+            requiresCompatibilities: .requiresCompatibilities,
+            cpu: .cpu,
+            memory: .memory,
+            runtimePlatform: .runtimePlatform
+          }' current.json > new-task-def.json
 
-          echo "No valid fallback found. Rollback failed."
-          exit 1
+        aws ecs register-task-definition \
+          --region $AWS_REGION \
+          --cli-input-json file://new-task-def.json > new-register.json
+
+        NEW_REV=$(jq -r '.taskDefinition.revision' new-register.json)
+        echo "NEW_REVISION=$NEW_REV" >> $GITHUB_ENV
+
+    - name: Deploy new revision
+      id: deploy
+      run: |
+        aws ecs update-service \
+          --cluster ${{ secrets.ECS_CLUSTER }} \
+          --service ${{ secrets.ECS_SERVICE }} \
+          --task-definition ${{ secrets.TASK_DEFINITION_NAME }}:$NEW_REVISION \
+          --force-new-deployment --region $AWS_REGION
+        echo "Deployed revision $NEW_REVISION"
+
+    - name: Wait for stabilization
+      id: wait
+      run: |
+        set -e
+        aws ecs wait services-stable \
+          --cluster ${{ secrets.ECS_CLUSTER }} \
+          --services ${{ secrets.ECS_SERVICE }} \
+          --region $AWS_REGION
+        echo "Service is stable"
+
+    - name: Fallback rollback logic
+      if: failure()
+      run: |
+        echo "Deployment failed. Evaluating fallback revisions..."
+        TD_FAMILY=${{ secrets.TASK_DEFINITION_NAME }}
+        CLUSTER=${{ secrets.ECS_CLUSTER }}
+        SERVICE=${{ secrets.ECS_SERVICE }}
+        REV_LIST=$(aws ecs list-task-definitions \
+          --family-prefix $TD_FAMILY \
+          --sort DESC --region $AWS_REGION \
+          --query 'taskDefinitionArns' --output text)
+
+        for ARN in $REV_LIST; do
+          REV=$(echo "$ARN" | awk -F: '{print $NF}')
+          IMAGE=$(aws ecs describe-task-definition \
+            --task-definition $ARN --region $AWS_REGION \
+            | jq -r '.taskDefinition.containerDefinitions[0].image')
+          TAG=$(echo "$IMAGE" | awk -F: '{print $2}')
+
+          if aws ecr describe-images --repository-name $REPO \
+             --region $AWS_REGION --image-ids imageTag=$TAG &> /dev/null; then
+            echo "Rolling back to revision $REV (uses image $TAG)"
+            aws ecs update-service \
+              --cluster $CLUSTER --service $SERVICE \
+              --task-definition $TD_FAMILY:$REV \
+              --force-new-deployment --region $AWS_REGION
+            echo "Rollback to $REV successful"
+            exit 0
+          fi
+        done
+        echo "No valid fallback found"
+        exit 1
