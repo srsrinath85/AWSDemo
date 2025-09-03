@@ -4,6 +4,16 @@ on:
   push:
     branches:
       - main  # Trigger deployment on push to the 'main' branch
+  workflow_dispatch:
+    inputs:
+      rollback:
+        description: 'Set to true to rollback to previous task definition'
+        required: false
+        default: 'false'
+      fail:
+        description: 'Set to true to force deployment failure (test rollback)'
+        required: false
+        default: 'false'
 
 jobs:
   build-and-deploy:
@@ -36,8 +46,19 @@ jobs:
           echo "ECS_CLUSTER = ${{ secrets.ECS_CLUSTER }}"
           echo "ECS_SERVICE = ${{ secrets.ECS_SERVICE }}"
           echo "TASK_DEFINITION_NAME = ${{ secrets.TASK_DEFINITION_NAME }}"
-          echo "AWS_ACCESS_KEY_ID = ${{ secrets.AWS_ACCESS_KEY_ID }}"
-          echo "AWS_SECRET_ACCESS_KEY = ${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+
+      - name: Get current running task definition revision
+        id: get-current-task-def
+        run: |
+          CURRENT_TASK_DEF=$(aws ecs describe-services \
+            --cluster ${{ secrets.ECS_CLUSTER }} \
+            --services ${{ secrets.ECS_SERVICE }} \
+            --region $AWS_REGION \
+            --query "services[0].taskDefinition" --output text)
+          echo "Current running task definition ARN: $CURRENT_TASK_DEF"
+          REVISION=$(echo $CURRENT_TASK_DEF | awk -F ':' '{print $NF}')
+          echo "Current revision: $REVISION"
+          echo "::set-output name=revision::$REVISION"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v1
@@ -115,41 +136,80 @@ jobs:
             --region $AWS_REGION \
             --cli-input-json file://updated_task_def.json
 
-      - name: Update ECS service to use the new task definition
+      - name: Fail deployment intentionally (for testing rollback)
+        if: ${{ github.event.inputs.fail == 'true' }}
         run: |
+          echo "Intentional failure triggered"
+          exit 1
+
+      - name: Deploy ECS service with rollback on failure (always succeed)
+        run: |
+          set -e
+
+          PREV_REVISION=${{ steps.get-current-task-def.outputs.revision }}
+
+          # If manual rollback requested, rollback and exit immediately
+          if [ "${{ github.event.inputs.rollback }}" = "true" ]; then
+            echo "Manual rollback requested, rolling back to revision $PREV_REVISION"
+            aws ecs update-service \
+              --cluster ${{ secrets.ECS_CLUSTER }} \
+              --service ${{ secrets.ECS_SERVICE }} \
+              --task-definition ${{ secrets.TASK_DEFINITION_NAME }}:$PREV_REVISION \
+              --region $AWS_REGION \
+              --force-new-deployment
+            echo "Rollback completed."
+            exit 0
+          fi
+
+          echo "Starting ECS service update..."
+
+          set +e
           NEW_TASK_DEF_REVISION=$(aws ecs describe-task-definition \
             --task-definition ${{ secrets.TASK_DEFINITION_NAME }} \
             --region $AWS_REGION \
             --query "taskDefinition.revision" --output text)
+          NEW_TASK_DEF_REVISION_EXIT=$?
+          set -e
 
-          if [ "$NEW_TASK_DEF_REVISION" == "None" ] || [ -z "$NEW_TASK_DEF_REVISION" ]; then
-            echo "❌ Failed to retrieve task definition revision."
-            exit 1
-          else
-            echo "✅ Task definition revision: $NEW_TASK_DEF_REVISION"
+          if [ $NEW_TASK_DEF_REVISION_EXIT -ne 0 ] || [ -z "$NEW_TASK_DEF_REVISION" ] || [ "$NEW_TASK_DEF_REVISION" == "None" ]; then
+            echo "❌ Failed to get new task definition revision. Rolling back..."
+            aws ecs update-service \
+              --cluster ${{ secrets.ECS_CLUSTER }} \
+              --service ${{ secrets.ECS_SERVICE }} \
+              --task-definition ${{ secrets.TASK_DEFINITION_NAME }}:$PREV_REVISION \
+              --region $AWS_REGION \
+              --force-new-deployment
+            echo "Rollback done."
+            exit 0
           fi
 
-          SERVICE_EXISTS=$(aws ecs describe-services \
-            --cluster ${{ secrets.ECS_CLUSTER }} \
-            --services ${{ secrets.ECS_SERVICE }} \
-            --region $AWS_REGION \
-            --query "services[0].serviceName" --output text)
+          echo "Deploying new revision: $NEW_TASK_DEF_REVISION"
 
-          if [ "$SERVICE_EXISTS" == "None" ]; then
-            echo "❌ ECS service does not exist."
-            exit 1
-          else
-            echo "✅ ECS service exists: $SERVICE_EXISTS"
-          fi
-
+          set +e
           aws ecs update-service \
             --cluster ${{ secrets.ECS_CLUSTER }} \
             --service ${{ secrets.ECS_SERVICE }} \
             --task-definition ${{ secrets.TASK_DEFINITION_NAME }}:$NEW_TASK_DEF_REVISION \
             --region $AWS_REGION \
             --force-new-deployment
+          DEPLOY_EXIT_CODE=$?
+          set -e
 
-          echo "✅ ECS service updated with the new task definition revision and forced new deployment."
+          if [ $DEPLOY_EXIT_CODE -ne 0 ]; then
+            echo "❌ Deployment failed, rolling back to previous revision $PREV_REVISION..."
+            aws ecs update-service \
+              --cluster ${{ secrets.ECS_CLUSTER }} \
+              --service ${{ secrets.ECS_SERVICE }} \
+              --task-definition ${{ secrets.TASK_DEFINITION_NAME }}:$PREV_REVISION \
+              --region $AWS_REGION \
+              --force-new-deployment
+            echo "Rollback done."
+          else
+            echo "✅ Deployment succeeded."
+          fi
+
+          # Always exit zero so pipeline does not fail
+          exit 0
 
       - name: Cleanup old ECR images (keep only latest 5)
         run: |
@@ -159,16 +219,15 @@ jobs:
 
           echo "Cleaning up old images in ECR repository $REPO_NAME except latest 5..."
 
-          # Get image digests sorted by pushedAt desc (latest first)
           IMAGES=$(aws ecr list-images --repository-name $REPO_NAME --region $REGION --query 'imageIds[*]' --output json)
           COUNT=$(echo $IMAGES | jq length)
 
-          if [ "$COUNT" -le 1 ]; then
-            echo "Less or equal to 5 images, no cleanup needed."
+          if [ "$COUNT" -le 5 ]; then
+            echo "5 or fewer images found, no cleanup needed."
             exit 0
           fi
 
-          TO_DELETE=$(echo $IMAGES | jq 'sort_by(.imagePushedAt) | reverse | .[1:] | .[].imageDigest' | tr -d '"')
+          TO_DELETE=$(aws ecr list-images --repository-name $REPO_NAME --region $REGION --query 'sort_by(imageIds,&imagePushedAt)[0:-5].imageDigest' --output text)
 
           for digest in $TO_DELETE; do
             echo "Deleting image with digest $digest"
