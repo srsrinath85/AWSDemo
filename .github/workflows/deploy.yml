@@ -64,7 +64,7 @@ jobs:
           IMAGE_TAG=${{ github.sha }}
           docker tag ${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG \
             ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${AWS_REGION}.amazonaws.com/${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG
-          echo "✅ Docker image tagged: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${AWS_REGION}.amazonaws.com/${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG"
+          echo "✅ Docker image tagged."
 
       - name: Push Docker image to ECR
         run: |
@@ -85,12 +85,12 @@ jobs:
             exit 1
           fi
 
-          NEW_TASK_DEF=$(echo $TASK_DEF | jq --arg IMAGE "$IMAGE" '
+          NEW_TASK_DEF=$(echo "$TASK_DEF" | jq --arg IMAGE "$IMAGE" '
             .taskDefinition as $td |
             {
               family: $td.family,
-              taskRoleArn: $td.taskRoleArn,
-              executionRoleArn: $td.executionRoleArn,
+              taskRoleArn: ($td.taskRoleArn // ""),
+              executionRoleArn: ($td.executionRoleArn // ""),
               networkMode: $td.networkMode,
               containerDefinitions: ($td.containerDefinitions | map(
                 if .name == "Democontainer" then
@@ -149,7 +149,7 @@ jobs:
             --region $AWS_REGION \
             --force-new-deployment
 
-          echo "✅ ECS service updated with the new task definition revision and forced new deployment."
+          echo "✅ ECS service updated with new task definition."
 
       - name: Cleanup old ECR images (keep only latest 5)
         run: |
@@ -157,22 +157,27 @@ jobs:
           REGION=$AWS_REGION
           ACCOUNT_ID=${{ secrets.AWS_ACCOUNT_ID }}
 
-          echo "Cleaning up old images in ECR repository $REPO_NAME except latest 5..."
+          echo "Cleaning up old images in ECR repository $REPO_NAME..."
 
-          # Get image digests sorted by pushedAt desc (latest first)
-          IMAGES=$(aws ecr list-images --repository-name $REPO_NAME --region $REGION --query 'imageIds[*]' --output json)
-          COUNT=$(echo $IMAGES | jq length)
+          IMAGES=$(aws ecr describe-images --repository-name $REPO_NAME --region $REGION \
+            --query 'sort_by(imageDetails,& imagePushedAt)[].imageDigest' --output text)
 
-          if [ "$COUNT" -le 1 ]; then
-            echo "Less or equal to 5 images, no cleanup needed."
+          IMAGE_ARRAY=($IMAGES)
+          NUM_IMAGES=${#IMAGE_ARRAY[@]}
+
+          if [ "$NUM_IMAGES" -le 5 ]; then
+            echo "✅ Less than or equal to 5 images. No cleanup needed."
             exit 0
           fi
 
-          TO_DELETE=$(echo $IMAGES | jq 'sort_by(.imagePushedAt) | reverse | .[1:] | .[].imageDigest' | tr -d '"')
+          TO_DELETE=("${IMAGE_ARRAY[@]:0:$((NUM_IMAGES - 5))}")
 
-          for digest in $TO_DELETE; do
-            echo "Deleting image with digest $digest"
-            aws ecr batch-delete-image --repository-name $REPO_NAME --region $REGION --image-ids imageDigest=$digest
+          for DIGEST in "${TO_DELETE[@]}"; do
+            echo "🗑️ Deleting image: $DIGEST"
+            aws ecr batch-delete-image \
+              --repository-name $REPO_NAME \
+              --region $REGION \
+              --image-ids imageDigest=$DIGEST
           done
 
-          echo "✅ Cleanup completed."
+          echo "✅ Old images cleaned up."
