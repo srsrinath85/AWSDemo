@@ -1,4 +1,4 @@
-name: Deploy to ECS Fargate with Auto Versioning and Random Suffix
+name: Deploy to ECS Fargate with Auto Versioning, Random Suffix, and Rollback
 
 on:
   push:
@@ -26,14 +26,35 @@ jobs:
       - name: Set AWS region
         run: aws configure set region $AWS_REGION
 
-      - name: Set image version with random suffix
-        id: set-version
+      - name: Get latest image version from ECR
+        id: get_latest_version
         run: |
-          VERSION_NUMBER=$(git rev-list --count HEAD)
-          RANDOM_SUFFIX=$(openssl rand -hex 3) # 6 hex chars
-          IMAGE_TAG="v${VERSION_NUMBER}-${RANDOM_SUFFIX}"
+          REPO=${{ secrets.ECR_REPOSITORY }}
+          REGION=$AWS_REGION
+          ACCOUNT=${{ secrets.AWS_ACCOUNT_ID }}
+
+          # Fetch all image tags from ECR
+          IMAGE_TAGS=$(aws ecr list-images --repository-name $REPO --region $REGION --query 'imageIds[*].imageTag' --output text)
+
+          # Extract only tags that start with 'v' and extract their version number before the hyphen (v1-xxxx)
+          VERSIONS=$(echo "$IMAGE_TAGS" | tr '\t' '\n' | grep -Eo '^v[0-9]+' | sed 's/v//' | sort -nr)
+
+          if [ -z "$VERSIONS" ]; then
+            NEW_VERSION=1
+          else
+            HIGHEST_VERSION=$(echo "$VERSIONS" | head -n1)
+            NEW_VERSION=$((HIGHEST_VERSION + 1))
+          fi
+
+          echo "Latest version in ECR: $NEW_VERSION"
+
+          RANDOM_SUFFIX=$(openssl rand -hex 3)
+          IMAGE_TAG="v${NEW_VERSION}-${RANDOM_SUFFIX}"
+
           echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
-          echo "🟢 Using image tag: $IMAGE_TAG"
+          echo "VERSION_NUMBER=$NEW_VERSION" >> $GITHUB_ENV
+
+          echo "🟢 Using new image tag: $IMAGE_TAG"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v1
@@ -49,13 +70,20 @@ jobs:
           docker push $IMAGE:$IMAGE_TAG
           echo "🟢 Docker image pushed: $IMAGE:$IMAGE_TAG"
 
-      - name: Get current task definition
+      - name: Get current ECS task definition
+        id: get_task_def
         run: |
           aws ecs describe-task-definition \
             --task-definition ${{ secrets.TASK_DEFINITION_NAME }} \
+            --region $AWS_REGION \
             > task-def.json
 
+          # Extract current revision to use in rollback if needed
+          CURRENT_REVISION=$(jq -r '.taskDefinition.revision' task-def.json)
+          echo "CURRENT_REVISION=$CURRENT_REVISION" >> $GITHUB_ENV
+
       - name: Create new task definition with updated image
+        id: register_task_def
         run: |
           IMAGE=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG
           jq --arg IMAGE "$IMAGE" '.taskDefinition |
@@ -81,23 +109,43 @@ jobs:
 
           aws ecs register-task-definition \
             --cli-input-json file://updated-task-def.json \
+            --region $AWS_REGION \
             > new-task-def.json
 
-          echo "NEW_REVISION=$(jq -r '.taskDefinition.revision' new-task-def.json)" >> $GITHUB_ENV
+          NEW_REVISION=$(jq -r '.taskDefinition.revision' new-task-def.json)
+          echo "NEW_REVISION=$NEW_REVISION" >> $GITHUB_ENV
           echo "🟢 Registered new task definition revision: $NEW_REVISION"
 
       - name: Update ECS service
+        id: update_service
         run: |
           aws ecs update-service \
             --cluster ${{ secrets.ECS_CLUSTER }} \
             --service ${{ secrets.ECS_SERVICE }} \
             --task-definition ${{ secrets.TASK_DEFINITION_NAME }}:$NEW_REVISION \
-            --force-new-deployment
+            --force-new-deployment \
+            --region $AWS_REGION
           echo "✅ ECS service updated to new revision: $NEW_REVISION"
 
       - name: Wait for ECS service to stabilize
+        id: wait_stable
         run: |
+          set -e
+          echo "🟡 Waiting for ECS service to stabilize..."
           aws ecs wait services-stable \
             --cluster ${{ secrets.ECS_CLUSTER }} \
-            --services ${{ secrets.ECS_SERVICE }}
+            --services ${{ secrets.ECS_SERVICE }} \
+            --region $AWS_REGION
           echo "✅ ECS service is stable."
+
+      - name: Rollback if deployment failed
+        if: failure()
+        run: |
+          echo "⚠️ Deployment failed. Rolling back to previous revision $CURRENT_REVISION"
+          aws ecs update-service \
+            --cluster ${{ secrets.ECS_CLUSTER }} \
+            --service ${{ secrets.ECS_SERVICE }} \
+            --task-definition ${{ secrets.TASK_DEFINITION_NAME }}:$CURRENT_REVISION \
+            --force-new-deployment \
+            --region $AWS_REGION
+          echo "✅ Rollback completed."
