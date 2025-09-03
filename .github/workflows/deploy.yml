@@ -1,4 +1,4 @@
-name: Deploy to ECS Fargate with Auto Versioning and Rollback
+name: Deploy with Auto Versioning and Rollback to ECS Fargate
 
 on:
   push:
@@ -17,9 +17,12 @@ jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
     env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_REGION: ${{ secrets.AWS_REGION }}
+      AWS_REGION: ${{ env.AWS_REGION }}
+      AWS_ACCOUNT_ID: ${{ env.AWS_ACCOUNT_ID }}
+      ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+      ECS_CLUSTER: ${{ env.ECS_CLUSTER }}
+      ECS_SERVICE: ${{ env.ECS_SERVICE }}
+      TASK_DEFINITION_NAME: ${{ env.TASK_DEFINITION_NAME }}
 
     steps:
       - name: Checkout code
@@ -33,42 +36,50 @@ jobs:
           fi
           echo "✅ Dockerfile found."
 
+      - name: Get latest image tag from ECR to increment version
+        id: get_latest_tag
+        env:
+          AWS_REGION: ${{ env.AWS_REGION }}
+          AWS_ACCOUNT_ID: ${{ env.AWS_ACCOUNT_ID }}
+          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+        run: |
+          set -e
+          echo "Fetching latest image tags..."
+          # List image tags starting with 'v' sorted descending (version tags)
+          TAGS=$(aws ecr list-images --repository-name $ECR_REPOSITORY --region $AWS_REGION --query 'imageIds[*].imageTag' --output text | tr '\t' '\n' | grep '^v[0-9]\+$' | sort -rV)
+          echo "Existing tags:"
+          echo "$TAGS"
+          
+          if [ -z "$TAGS" ]; then
+            echo "No previous version found. Starting at v1."
+            echo "IMAGE_TAG=v1" >> $GITHUB_ENV
+          else
+            # Extract the highest version number and increment
+            HIGHEST_TAG=$(echo "$TAGS" | head -n1)
+            echo "Highest tag found: $HIGHEST_TAG"
+            VERSION_NUM=${HIGHEST_TAG#v}
+            NEXT_VERSION=$((VERSION_NUM + 1))
+            echo "Next version: v$NEXT_VERSION"
+            echo "IMAGE_TAG=v$NEXT_VERSION" >> $GITHUB_ENV
+          fi
+
       - name: Set AWS region
         run: aws configure set region $AWS_REGION
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+
       - name: Log in to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v1
-
-      - name: Get last deployed task definition revision
-        id: get-current-revision
-        run: |
-          REVISION=$(aws ecs describe-services \
-            --cluster $ECS_CLUSTER \
-            --services $ECS_SERVICE \
-            --region $AWS_REGION \
-            --query "services[0].taskDefinition" --output text | awk -F':' '{print $2}')
-          echo "CURRENT_REVISION=$REVISION" >> $GITHUB_ENV
-          echo "Current deployed task definition revision: $REVISION"
-
-      - name: Calculate new image tag version (v1, v2, ...)
-        id: calc-version
-        run: |
-          if [ -z "$CURRENT_REVISION" ]; then
-            echo "No current revision found, starting from v1"
-            echo "IMAGE_TAG=v1" >> $GITHUB_ENV
-          else
-            # Strip leading 'v' and convert to number, increment by 1
-            CURRENT_VER_NUM=$(echo "$CURRENT_REVISION" | sed 's/^v//' || echo "0")
-            # If it's not a number, fallback to 0
-            if ! [[ "$CURRENT_VER_NUM" =~ ^[0-9]+$ ]]; then
-              CURRENT_VER_NUM=0
-            fi
-            NEW_VER_NUM=$((CURRENT_VER_NUM + 1))
-            echo "IMAGE_TAG=v$NEW_VER_NUM" >> $GITHUB_ENV
-          fi
-          echo "New image tag will be $IMAGE_TAG"
+        env:
+          AWS_REGION: ${{ env.AWS_REGION }}
 
       - name: Build, tag, and push Docker image
+        env:
+          AWS_ACCOUNT_ID: ${{ env.AWS_ACCOUNT_ID }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ env.IMAGE_TAG }}
         run: |
           docker build -t $ECR_REPOSITORY:$IMAGE_TAG myjavaapp/
           docker tag $ECR_REPOSITORY:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:$IMAGE_TAG
@@ -76,12 +87,28 @@ jobs:
           echo "✅ Docker image pushed with tag: $IMAGE_TAG"
 
       - name: Get current task definition JSON
-        run: aws ecs describe-task-definition \
-          --task-definition $TASK_DEFINITION_NAME \
-          --region $AWS_REGION > current_task_def.json
+        env:
+          TASK_DEFINITION_NAME: ${{ env.TASK_DEFINITION_NAME }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "$TASK_DEFINITION_NAME" \
+            --region "$AWS_REGION" > current_task_def.json
 
-      - name: Register new ECS task definition with updated image
-        id: register-task-def
+      - name: Extract current task definition revision for rollback
+        id: get_current_revision
+        run: |
+          REVISION=$(jq -r '.taskDefinition.revision' current_task_def.json)
+          echo "CURRENT_TASK_DEF_REVISION=$REVISION" >> $GITHUB_ENV
+          echo "Current task definition revision: $REVISION"
+
+      - name: Create new task definition JSON with updated image
+        env:
+          AWS_ACCOUNT_ID: ${{ env.AWS_ACCOUNT_ID }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ env.IMAGE_TAG }}
+          TASK_DEFINITION_NAME: ${{ env.TASK_DEFINITION_NAME }}
         run: |
           IMAGE="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:$IMAGE_TAG"
 
@@ -108,72 +135,88 @@ jobs:
 
           echo "$NEW_TASK_DEF" > updated_task_def.json
 
+      - name: Register new task definition
+        env:
+          AWS_REGION: ${{ env.AWS_REGION }}
+        run: |
           aws ecs register-task-definition \
-            --region $AWS_REGION \
+            --region "$AWS_REGION" \
             --cli-input-json file://updated_task_def.json > registered_task_def.json
-
+          
           NEW_REVISION=$(jq -r '.taskDefinition.revision' registered_task_def.json)
           echo "NEW_TASK_DEF_REVISION=$NEW_REVISION" >> $GITHUB_ENV
-          echo "Registered new task definition revision: $NEW_REVISION"
+          echo "✅ Registered new task definition revision: $NEW_REVISION"
 
-      - name: Save previous task definition revision for rollback
-        run: echo "PREVIOUS_TASK_DEF_REVISION=$CURRENT_REVISION" >> $GITHUB_ENV
-
-      - name: Update ECS Service to use the new task definition
+      - name: Update ECS service with new task definition
+        env:
+          ECS_CLUSTER: ${{ env.ECS_CLUSTER }}
+          ECS_SERVICE: ${{ env.ECS_SERVICE }}
+          TASK_DEFINITION_NAME: ${{ env.TASK_DEFINITION_NAME }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+          NEW_TASK_DEF_REVISION: ${{ env.NEW_TASK_DEF_REVISION }}
         run: |
           aws ecs update-service \
-            --cluster $ECS_CLUSTER \
-            --service $ECS_SERVICE \
-            --task-definition $TASK_DEFINITION_NAME:$NEW_TASK_DEF_REVISION \
-            --region $AWS_REGION \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --task-definition "$TASK_DEFINITION_NAME:$NEW_TASK_DEF_REVISION" \
+            --region "$AWS_REGION" \
             --force-new-deployment
-          echo "Updated ECS service to new task definition revision $NEW_TASK_DEF_REVISION"
+          echo "✅ ECS service updated to task definition revision $NEW_TASK_DEF_REVISION"
 
       - name: Wait for ECS service to stabilize
+        env:
+          ECS_CLUSTER: ${{ env.ECS_CLUSTER }}
+          ECS_SERVICE: ${{ env.ECS_SERVICE }}
+          AWS_REGION: ${{ env.AWS_REGION }}
         run: |
-          set +e
-          aws ecs wait services-stable --cluster $ECS_CLUSTER --services $ECS_SERVICE --region $AWS_REGION
-          STATUS=$?
-          set -e
-          if [ $STATUS -ne 0 ]; then
-            echo "Deployment failed, rolling back..."
-            exit 1
-          else
-            echo "Deployment succeeded and service is stable."
-          fi
-
-      - name: Rollback if deployment failed
-        if: failure()
-        run: |
-          echo "Rolling back to previous task definition revision: $PREVIOUS_TASK_DEF_REVISION"
-          aws ecs update-service \
-            --cluster $ECS_CLUSTER \
-            --service $ECS_SERVICE \
-            --task-definition $TASK_DEFINITION_NAME:$PREVIOUS_TASK_DEF_REVISION \
-            --region $AWS_REGION \
-            --force-new-deployment
-          echo "Rollback initiated."
+          echo "Waiting for ECS service to stabilize..."
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --region "$AWS_REGION"
+          echo "✅ ECS service deployment is stable."
 
       - name: Cleanup old ECR images (keep latest 5)
+        env:
+          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+          AWS_REGION: ${{ env.AWS_REGION }}
         run: |
-          IMAGE_IDS=$(aws ecr describe-images --repository-name $ECR_REPOSITORY \
-            --region $AWS_REGION \
-            --query 'sort_by(imageDetails,& imagePushedAt)[].imageDigest' \
-            --output text)
-
-          IMAGE_ARRAY=($IMAGE_IDS)
+          echo "Cleaning up old images in ECR..."
+          IMAGE_DIGESTS=$(aws ecr describe-images --repository-name $ECR_REPOSITORY --region $AWS_REGION --query 'sort_by(imageDetails,& imagePushedAt)[].imageDigest' --output text)
+          IMAGE_ARRAY=($IMAGE_DIGESTS)
           COUNT=${#IMAGE_ARRAY[@]}
 
           if [ $COUNT -le 5 ]; then
-            echo "No images to clean up."
+            echo "✅ 5 or fewer images, no cleanup needed."
             exit 0
           fi
 
-          DELETE_DIGESTS=("${IMAGE_ARRAY[@]:0:$((COUNT - 5))}")
+          TO_DELETE=("${IMAGE_ARRAY[@]:0:$((COUNT - 5))}")
 
-          for DIGEST in "${DELETE_DIGESTS[@]}"; do
+          for DIGEST in "${TO_DELETE[@]}"; do
+            echo "Deleting old image digest: $DIGEST"
             aws ecr batch-delete-image --repository-name $ECR_REPOSITORY --region $AWS_REGION --image-ids imageDigest=$DIGEST
-            echo "Deleted old image digest: $DIGEST"
           done
+          echo "✅ Old images cleanup completed."
 
-          echo "Cleanup complete."
+      - name: Rollback on failure
+        if: failure()
+        env:
+          ECS_CLUSTER: ${{ env.ECS_CLUSTER }}
+          ECS_SERVICE: ${{ env.ECS_SERVICE }}
+          TASK_DEFINITION_NAME: ${{ env.TASK_DEFINITION_NAME }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+          CURRENT_TASK_DEF_REVISION: ${{ env.CURRENT_TASK_DEF_REVISION }}
+        run: |
+          echo "Deployment failed. Rolling back to previous task definition revision: $CURRENT_TASK_DEF_REVISION"
+          if [ -z "$CURRENT_TASK_DEF_REVISION" ]; then
+            echo "No previous revision found, rollback aborted."
+            exit 1
+          fi
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --task-definition "$TASK_DEFINITION_NAME:$CURRENT_TASK_DEF_REVISION" \
+            --region "$AWS_REGION" \
+            --force-new-deployment
+          echo "✅ Rollback initiated successfully."
