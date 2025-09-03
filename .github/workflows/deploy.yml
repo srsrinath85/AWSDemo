@@ -1,9 +1,12 @@
-name: Deploy to ECS Fargate
+name: Deploy v1.0 to ECS Fargate
 
 on:
   push:
     branches:
       - main
+
+env:
+  IMAGE_VERSION: v1.0
 
 jobs:
   build-and-deploy:
@@ -12,129 +15,123 @@ jobs:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       AWS_REGION: ${{ secrets.AWS_REGION }}
+      IMAGE_TAG: ${{ env.IMAGE_VERSION }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v2
 
-      - name: Verify Dockerfile presence
+      - name: Validate Dockerfile
         run: |
-          echo "Checking for Dockerfile..."
-          ls -la myjavaapp
           if [ ! -f myjavaapp/Dockerfile ]; then
-            echo "Dockerfile not found!"
+            echo "❌ Dockerfile not found in myjavaapp!"
             exit 1
           fi
-          
+          echo "✅ Dockerfile found."
+
+      - name: Set AWS region
+        run: aws configure set region $AWS_REGION
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v1
 
-      - name: Build Docker image
-        run: |
-          IMAGE_TAG=${{ github.sha }}
-          docker build -t ${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG myjavaapp/
-
       - name: Log in to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v1
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_REGION: ${{ secrets.AWS_REGION }}
 
-      - name: Tag & push image to ECR
+      - name: Build, Tag and Push Docker Image
         run: |
-          IMAGE_TAG=${{ github.sha }}
-          ECR_URI="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${AWS_REGION}.amazonaws.com/${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG"
-          docker tag ${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG $ECR_URI
-          docker push $ECR_URI
-          echo "IMAGE=$ECR_URI" >> $GITHUB_ENV
+          docker build -t ${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG myjavaapp/
+          docker tag ${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG \
+            ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${AWS_REGION}.amazonaws.com/${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG
+          
+          docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${AWS_REGION}.amazonaws.com/${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG
+          echo "✅ Docker image pushed with tag: $IMAGE_TAG"
 
-      - name: Capture current task definition revision
-        id: prev
+      - name: Get current task definition
+        id: get-task-def
         run: |
-          TD=$(aws ecs describe-services \
-            --cluster ${{ secrets.ECS_CLUSTER }} \
-            --services ${{ secrets.ECS_SERVICE }} \
-            --region $AWS_REGION \
-            --query "services[0].taskDefinition" --output text)
-          echo "Previous task definition ARN: $TD"
-          echo "::set-output name=revision::$(echo "$TD" | awk -F ':' '{print $NF}')"
-
-      - name: Register updated task definition
-        run: |
-          IMAGE="$IMAGE"
-          TD_JSON=$(aws ecs describe-task-definition \
+          aws ecs describe-task-definition \
             --task-definition ${{ secrets.TASK_DEFINITION_NAME }} \
-            --region $AWS_REGION)
-          UPDATED=$(echo "$TD_JSON" | jq --arg IMAGE "$IMAGE" '
-            .taskDefinition as $td |
+            --region $AWS_REGION \
+            > current_task_def.json
+
+      - name: Create new task definition with updated image
+        id: register-task-def
+        run: |
+          IMAGE="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${AWS_REGION}.amazonaws.com/${{ secrets.ECR_REPOSITORY }}:$IMAGE_TAG"
+
+          NEW_TASK_DEF=$(jq --arg IMAGE "$IMAGE" '.taskDefinition |
             {
-              family: $td.family,
-              taskRoleArn: ($td.taskRoleArn // ""),
-              executionRoleArn: ($td.executionRoleArn // ""),
-              networkMode: $td.networkMode,
-              containerDefinitions:
-                ($td.containerDefinitions |
-                  map(if .name == "Democontainer" then .image = $IMAGE else . end)),
-              volumes: $td.volumes,
-              placementConstraints: $td.placementConstraints,
-              requiresCompatibilities: $td.requiresCompatibilities,
-              cpu: $td.cpu,
-              memory: $td.memory,
-              runtimePlatform: $td.runtimePlatform
-            }
-          ')
-          echo "$UPDATED" > updated_task_def.json
-          aws ecs register-task-definition --cli-input-json file://updated_task_def.json --region $AWS_REGION
+              family: .family,
+              taskRoleArn: (.taskRoleArn // ""),
+              executionRoleArn: (.executionRoleArn // ""),
+              networkMode: .networkMode,
+              containerDefinitions: (.containerDefinitions | map(
+                if .name == "Democontainer" then
+                  .image = $IMAGE | .memory = (.memory // 512)
+                else
+                  .
+                end
+              )),
+              volumes: .volumes,
+              placementConstraints: .placementConstraints,
+              requiresCompatibilities: .requiresCompatibilities,
+              cpu: .cpu,
+              memory: .memory,
+              runtimePlatform: .runtimePlatform
+            }' current_task_def.json)
 
-      - name: Deploy or Rollback with safeties (never fail)
-        run: |
-          PREV=${{ steps.prev.outputs.revision }}
-          NEW=$(aws ecs describe-task-definition \
-            --task-definition ${{ secrets.TASK_DEFINITION_NAME }} \
+          echo "$NEW_TASK_DEF" > updated_task_def.json
+
+          aws ecs register-task-definition \
             --region $AWS_REGION \
-            --query "taskDefinition.revision" --output text)
+            --cli-input-json file://updated_task_def.json \
+            > registered_task_def.json
 
-          echo "Previous revision: $PREV, New revision: $NEW"
+          NEW_REVISION=$(jq -r '.taskDefinition.revision' registered_task_def.json)
+          echo "TASK_DEF_REVISION=$NEW_REVISION" >> $GITHUB_ENV
+          echo "✅ Registered new task definition revision: $NEW_REVISION"
 
-          echo "Updating service to new revision..."
-          set +e
+      - name: Update ECS Service with new task definition
+        run: |
           aws ecs update-service \
             --cluster ${{ secrets.ECS_CLUSTER }} \
             --service ${{ secrets.ECS_SERVICE }} \
-            --task-definition ${{ secrets.TASK_DEFINITION_NAME }}:$NEW \
+            --task-definition ${{ secrets.TASK_DEFINITION_NAME }}:$TASK_DEF_REVISION \
             --region $AWS_REGION \
             --force-new-deployment
-          RET=$?
-          set -e
+          echo "✅ ECS Service updated to use task definition revision $TASK_DEF_REVISION"
 
-          if [ "$RET" -ne 0 ] || [ -z "$NEW" ]; then
-            echo "Deployment failed or invalid new revision. Rolling back to ${PREV}..."
-            aws ecs update-service \
-              --cluster ${{ secrets.ECS_CLUSTER }} \
-              --service ${{ secrets.ECS_SERVICE }} \
-              --task-definition ${{ secrets.TASK_DEFINITION_NAME }}:$PREV \
-              --region $AWS_REGION \
-              --force-new-deployment
-            echo "Rollback completed."
-          else
-            echo "Deployment succeeded using revision $NEW."
-          fi
-
-      - name: Cleanup old images in ECR (keep latest 5)
+      - name: Verify ECS Deployment
         run: |
-          REPO=${{ secrets.ECR_REPOSITORY }}
-          IMAGE_IDS=$(aws ecr list-images --repository-name $REPO --region $AWS_REGION \
-            --query 'imageIds[*]' --output json)
-          IMAGES=($(echo $IMAGE_IDS | jq -r '.[].imageDigest'))
-          COUNT=${#IMAGES[@]}
+          echo "🧪 Waiting for ECS service deployment to stabilize..."
+          aws ecs wait services-stable \
+            --cluster ${{ secrets.ECS_CLUSTER }} \
+            --services ${{ secrets.ECS_SERVICE }} \
+            --region $AWS_REGION
+          echo "✅ ECS service deployment is stable."
 
-          if [ "$COUNT" -le 5 ]; then
-            echo "No cleanup needed. Only $COUNT images."
-          else
-            TO_DELETE=("${IMAGES[@]:0:$((COUNT-5))}")
-            for DIGEST in "${TO_DELETE[@]}"; do
-              aws ecr batch-delete-image --repository-name $REPO --region $AWS_REGION --image-ids imageDigest=$DIGEST
-              echo "Deleted old image: $DIGEST"
-            done
+      - name: Cleanup old ECR Images (keep latest 5)
+        run: |
+          echo "🧹 Cleaning up old images from ECR..."
+          IMAGE_IDS=$(aws ecr describe-images --repository-name ${{ secrets.ECR_REPOSITORY }} \
+            --region $AWS_REGION \
+            --query 'sort_by(imageDetails,& imagePushedAt)[].imageDigest' \
+            --output text)
+
+          IMAGE_ARRAY=($IMAGE_IDS)
+          COUNT=${#IMAGE_ARRAY[@]}
+
+          if [ $COUNT -le 5 ]; then
+            echo "✅ Less than 5 images. No cleanup required."
+            exit 0
           fi
+
+          DELETE_DIGESTS=("${IMAGE_ARRAY[@]:0:$((COUNT - 5))}")
+          for DIGEST in "${DELETE_DIGESTS[@]}"; do
+            aws ecr batch-delete-image \
+              --repository-name ${{ secrets.ECR_REPOSITORY }} \
+              --region $AWS_REGION \
+              --image-ids imageDigest=$DIGEST
+            echo "🗑️ Deleted old image digest: $DIGEST"
+          done
